@@ -56,10 +56,12 @@ def kernel_fma(
     - ActInputs (optional) has shape (B, M, N)
 
     'ActInputs' optionally saves the A x W + C intermediate for backward computations
+
+    This kernel will consolidate over K
     """
 
     # extract metaparameters
-    BLOCK_M, GROUP_M = META["BLOCK_ROW"], META["GROUP_M"]
+    BLOCK_M, GROUP_M = META["BLOCK_ROW"], META["GROUP_ROW"]
     BLOCK_N, BLOCK_K = META["BLOCK_COL"], META["BLOCK_K"]
 
     # programs are grouped together to improve L2 hit rate
@@ -186,7 +188,7 @@ def fused_matmul(
         BIAS=bias is not None,
         # speed optimization: group the programs
         # improve on data reuse in L2 cache
-        GROUP_M=8,
+        GROUP_ROW=8,
         BLOCK_K=32,
         SAVE_ACT_INPUTS=save_inputs
     )
@@ -233,12 +235,15 @@ def kernel_fma_grad_in(
     """
     Kernel for computing `grad_out = grad_in * activation_grad(inputs) @ W^T`
     - grad_out has shape (B, M, N)
+    - grad_act has shape (B, M, N)
     - W has shape (K, N)
     - grad_in has shape (B, M, K)
     - X has shape (B, M, K)
+
+    This kernel will consolidate over N
     """
     # extract metaparameters
-    BLOCK_M, GROUP_M = META["BLOCK_ROW"], META["GROUP_M"]
+    BLOCK_M, GROUP_M = META["BLOCK_ROW"], META["GROUP_ROW"]
     BLOCK_N, BLOCK_K = META["BLOCK_N"], META["BLOCK_COL"]
 
     # programs are grouped together to improve L2 hit rate
@@ -366,7 +371,7 @@ def fused_matmul_backward(
         # optional fused activation
         ACTIVATION_GRAD=activation_grad,
         # data reuse optimization
-        GROUP_M=16,
+        GROUP_ROW=8,
         BLOCK_N=32,
         ACTIVATION_GRAD_REQ_INPUTS=activation_grad_req_inputs,
         SAVE_ACT_GRAD=trainable_weight or trainable_bias
