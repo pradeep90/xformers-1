@@ -9,14 +9,23 @@ import torch
 import triton
 import triton.language as tl
 
-from xformers.triton.configs_matmul import kernel_config
-
 # CREDITS: Initially inspired by the Triton tutorial on matrix multiplications
 
 
 # fmt: off
 @triton.autotune(
-    configs=kernel_config,
+    configs=[
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 32}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_ROW': 32 , 'BLOCK_COL': 64}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 256}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_ROW': 256, 'BLOCK_COL': 128}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_ROW': 256, 'BLOCK_COL': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 256}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 32}, num_stages=4, num_warps=4),
+        ],
     key=["M", "N", "K"],
 )
 @triton.jit
@@ -196,7 +205,18 @@ def fused_matmul(
 
 # fmt: off
 @triton.autotune(
-    configs=kernel_config,
+    configs=[
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 32}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_ROW': 32 , 'BLOCK_COL': 64}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 256}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_ROW': 256, 'BLOCK_COL': 128}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_ROW': 256, 'BLOCK_COL': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 256}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 32}, num_stages=4, num_warps=4),
+        ],
     key=["M", "N", "K"],
 )
 @triton.jit
