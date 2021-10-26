@@ -140,21 +140,17 @@ def fused_matmul(
     This wrapper kicks the `kernel_fma` Triton kernel
     """
 
-    if x.ndim == 2:
-        x = x.unsqueeze(0)
-        _should_squeeze = True
-    else:
-        _should_squeeze = False
+    x_ = x if x.ndim == 3 else x.unsqueeze(0)
 
     assert (
-        x.shape[2] == weight.shape[1]
-    ), f"Incompatible dimensions in between inputs and weight, {x.shape} - {weight.shape}"
+        x_.shape[2] == weight.shape[1]
+    ), f"Incompatible dimensions in between inputs and weight, {x_.shape} - {weight.shape}"
     assert bias is None or bias.is_contiguous()
     assert (
         bias is None or bias.shape[0] == weight.shape[0]
     ), "Incompatible dimensions in between weight and bias"
 
-    B, M, K = x.shape
+    B, M, K = x_.shape
     N, K = weight.shape
 
     # FIXME: @lefaudeux
@@ -175,14 +171,14 @@ def fused_matmul(
     # fmt: off
     kernel_fma[grid](
         # data ptrs
-        outputs, x, weight,
+        outputs, x_, weight,
         bias if bias is not None else x,  # auto skip bias if not present
         act_inputs,
         # shapes
         M, N, K,
         # strides
         outputs.stride(0), outputs.stride(1), outputs.stride(2),
-        x.stride(0), x.stride(1), x.stride(2),
+        x_.stride(0), x_.stride(1), x_.stride(2),
         weight.stride(0), weight.stride(1),
         act_inputs.stride(0), act_inputs.stride(1), act_inputs.stride(2),
         # optional fused activation
@@ -197,8 +193,7 @@ def fused_matmul(
     )
     # fmt: on
 
-    if _should_squeeze:
-        outputs.squeeze_()
+    outputs = outputs if x.ndim == 3 else outputs.squeeze(0)
 
     return (outputs, act_inputs) if save_inputs else (outputs, None)
 
@@ -332,23 +327,17 @@ def fused_matmul_backward(
     .. note: The weight buffer is transposed on the fly
     """
 
-    if grad_out.ndim == 2:
-        # Add the batch dimension
-        # This is inelegant and maybe slow, but never really used in the xformers context
-        grad_out = grad_out.unsqueeze(0)
-        _should_squeeze = True
-    else:
-        _should_squeeze = False
+    grad_out_ = grad_out if grad_out.ndim == 3 else grad_out.unsqueeze(0)
 
     assert (
-        grad_out.shape[2] == weight.shape[0]
+        grad_out_.shape[2] == weight.shape[0]
     ), "Incompatible dimensions in between grad_out and weight"
 
-    B, M, N = grad_out.shape
+    B, M, N = grad_out_.shape
     N, K = weight.shape
 
-    grad_in = torch.empty((B, M, K), device=grad_out.device, dtype=grad_out.dtype)
-    grad_act = torch.empty_like(grad_out)
+    grad_in = torch.empty((B, M, K), device=grad_out_.device, dtype=grad_out_.dtype)
+    grad_act = torch.empty_like(grad_out_)
 
     # Compute the gradient for the inputs
     def grid(META):
@@ -359,18 +348,18 @@ def fused_matmul_backward(
 
     if activation_inputs is None:
         # place holder, this will not be used really
-        activation_inputs = grad_out
+        activation_inputs = grad_out_
 
     # fmt: off
     kernel_fma_grad_in[grid](
         # data ptrs
-        grad_in, grad_act, activation_inputs, grad_out, weight,
+        grad_in, grad_act, activation_inputs, grad_out_, weight,
         # shapes
         M, N, K,
         # strides
         grad_in.stride(0), grad_in.stride(1), grad_in.stride(2),
         grad_act.stride(0), grad_act.stride(1), grad_act.stride(2),
-        grad_out.stride(0), grad_out.stride(1), grad_out.stride(2),
+        grad_out_.stride(0), grad_out_.stride(1), grad_out_.stride(2),
         activation_inputs.stride(0), activation_inputs.stride(1), activation_inputs.stride(2),
         weight.stride(0), weight.stride(1),
         # optional fused activation
@@ -389,14 +378,11 @@ def fused_matmul_backward(
     grad_weight = None
     if trainable_weight:
         grad_act_ = torch.reshape(grad_act, (grad_act.shape[0]*grad_act.shape[1], grad_act.shape[2])).transpose(1, 0)
-        if inputs.ndim == 2:
-            inputs = inputs.unsqueeze(0)
-        inputs_ = torch.reshape(inputs, (inputs.shape[0]*inputs.shape[1], inputs.shape[2]))
-        grad_weight = triton.ops.matmul(grad_act_, inputs_)
 
-    if _should_squeeze:
-        grad_in = grad_in.squeeze_()
+        inputs_ = inputs if inputs.ndim == 3 else inputs.unsqueeze(0)
+        inputs_ = inputs_.flatten(0, 1)
+        grad_weight = triton.ops.matmul(grad_act_, inputs_)
 
     del grad_act
 
-    return grad_in, grad_weight, grad_bias
+    return grad_in.reshape_as(inputs), grad_weight, grad_bias
