@@ -31,31 +31,31 @@ import triton.language as tl
 @triton.jit
 def kernel_fma(
     # Pointers to matrices
-    D, A, W, C, In,
+    OUT, INPUT, WEIGHT, BIAS, ACT_INPUTS,
     # Matrix dimensions
     M, N, K,
     # The stride variables represent how much to increase the ptr by when moving by 1
     # element in a particular dimension. E.g. stride_am is how much to increase a_ptr
     # by to get the element one row down (A has M rows)
-    stride_db,  stride_dm, stride_dn,
-    stride_ab, stride_am, stride_ak,
+    stride_db,  stride_dm,
+    stride_ab, stride_am,
     stride_wn, stride_wk,
-    stride_ib,  stride_im, stride_in,
+    stride_ib,  stride_im,
     # Meta-parameters
     **META,
 ):
     # fmt: on
 
     """
-    Kernel for computing D = activation(A x W + C)
+    Kernel for computing Out = activation(A x W + C)
 
-    - A has shape (B, M, K)
-    - W has shape (K, N)
-    - C has shape (N,)
-    - D has shape (B, M, N)
-    - In (optional) has shape (B, M, N)
+    - Input has shape (B, M, K)
+    - Weight has shape (K, N)
+    - Bias has shape (N,)
+    - Output has shape (B, M, N)
+    - ActInputs (optional) has shape (B, M, N)
 
-    'In' optionally saves the A x W + C intermediate for backward computations
+    'ActInputs' optionally saves the A x W + C intermediate for backward computations
     """
 
     # extract metaparameters
@@ -85,46 +85,42 @@ def kernel_fma(
     # for rows (resp. col) of C
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # rk denotes a range of indices for columns
-    # (resp. rows) of A (resp. B)
     rk = tl.arange(0, BLOCK_K)
 
     # the memory addresses of elements in the first block of
     # A and W can be computed using numpy-style broadcasting
-    D += rm[:, None] * stride_dm + rn[None, :] * stride_dn + batch_id * stride_db
-    A += rm[:, None] * stride_am + rk[None, :] * stride_ak + batch_id * stride_ab
-    W += rk[:, None] * stride_wk + rn[None, :] * stride_wn
+    Input_ptrs = INPUT + batch_id * stride_ab + rm[:, None] * stride_am + rk[None, :]
+    Weight_ptrs = WEIGHT + rk[:, None] * stride_wk + rn[None, :] * stride_wn
 
     # initialize and iteratively update accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     if META["BIAS"]:
-        bias = tl.load(C + rn, mask=rn < N, other=0.0).to(tl.float32)
+        bias = tl.load(BIAS + rn, mask=rn < N, other=0.0).to(tl.float32)
         acc += bias[None, :]
 
     for _ in range(K, 0, -BLOCK_K):
         # block level matrix multiplication
-        a = tl.load(A)
-        w = tl.load(W)
-        acc += tl.dot(a, w).to(tl.float32)
+        a = tl.load(Input_ptrs)
+        Input_ptrs += BLOCK_K
 
-        # increment pointers so that the next blocks of A and B
-        # are loaded during the next iteration
-        A += BLOCK_K * stride_ak
-        W += BLOCK_K * stride_wk
+        w = tl.load(Weight_ptrs)
+        Weight_ptrs += BLOCK_K * stride_wk
+
+        acc += tl.dot(a, w).to(tl.float32)
 
     # optional: save the activation inputs
     if META["SAVE_ACT_INPUTS"]:
-        In += rm[:, None] * stride_im + rn[None, :] * stride_in + batch_id * stride_ib
-        tl.store(In, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+        ActInputs_ptrs = ACT_INPUTS + batch_id * stride_ib + rm[:, None] * stride_im + rn[None, :]
+        tl.store(ActInputs_ptrs, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
 
     # optional: fused activation (while the data is in shared memory)
     if META["ACTIVATION"]:
         acc = META["ACTIVATION"](acc)
 
     # write back result
-    tl.store(D, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+    Out_ptrs = OUT + batch_id * stride_db + rm[:, None] * stride_dm + rn[None, :]
+    tl.store(Out_ptrs, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
 # Activation needs to be a triton kernel
@@ -139,6 +135,9 @@ def fused_matmul(
     Compute e = activation(x @ weight + bias).
     This wrapper kicks the `kernel_fma` Triton kernel
     """
+
+    if not x.is_contiguous():
+        x = x.contiguous()
 
     x_ = x if x.ndim == 3 else x.unsqueeze(0)
 
@@ -177,10 +176,10 @@ def fused_matmul(
         # shapes
         M, N, K,
         # strides
-        outputs.stride(0), outputs.stride(1), outputs.stride(2),
-        x_.stride(0), x_.stride(1), x_.stride(2),
+        outputs.stride(0), outputs.stride(1),
+        x_.stride(0), x_.stride(1),
         weight.stride(0), weight.stride(1),
-        act_inputs.stride(0), act_inputs.stride(1), act_inputs.stride(2),
+        act_inputs.stride(0), act_inputs.stride(1),
         # optional fused activation
         ACTIVATION=activation,
         # optional fused bias
@@ -221,11 +220,11 @@ def kernel_fma_grad_in(
     # Tensor dimensions
     M, N, K,
     # strides for all the gradients
-    stride_gib, stride_gim, stride_gik,
-    stride_gab, stride_gam, stride_gan,
-    stride_gob, stride_gom, stride_gon,
+    stride_gib, stride_gim,
+    stride_gab, stride_gam,
+    stride_gob, stride_gom,
     # strides for the extra data
-    stride_aib, stride_aim, stride_ain,
+    stride_aib, stride_aim,
     stride_wn, stride_wk,
     # Meta-parameters
     **META,
@@ -266,27 +265,29 @@ def kernel_fma_grad_in(
     rn = tl.arange(0, BLOCK_N)
 
     # memory blocks can be computed using numpy-style broadcasting
-    GRAD_OUT += rm[:, None] * stride_gom + rn[None, :] * stride_gon + batch_id * stride_gob
-    GRAD_ACT += rm[:, None] * stride_gam + rn[None, :] * stride_gan + batch_id * stride_gab
-    ACT_IN += rm[:, None] * stride_aim + rn[None, :] * stride_ain + batch_id * stride_aib
-    GRAD_IN += rm[:, None] * stride_gim + rk[None, :] * stride_gik + batch_id * stride_gib
-    W += rn[:, None] * stride_wn + rk[None, :] * stride_wk
+    grad_out_ptrs = GRAD_OUT + rm[:, None] * stride_gom + rn[None, :] + batch_id * stride_gob
+    grad_act_ptrs = GRAD_ACT + rm[:, None] * stride_gam + rn[None, :] + batch_id * stride_gab
+    act_in_ptrs = ACT_IN + rm[:, None] * stride_aim + rn[None, :] + batch_id * stride_aib
+    weight_ptrs = W + rn[:, None] * stride_wn + rk[None, :] * stride_wk
 
     # initialize and iteratively update accumulator
     grad_in = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     act_grad_fn = META["ACTIVATION_GRAD"]
 
     for _ in range(N, 0, -BLOCK_N):
-        grad_out = tl.load(GRAD_OUT)  # BLOCK_M x BLOCK_N
-        w = tl.load(W)  # BLOCK_N x BLOCK_K
+        grad_out = tl.load(grad_out_ptrs)  # BLOCK_M x BLOCK_N
+        grad_out_ptrs += BLOCK_N
+
+        w = tl.load(weight_ptrs)  # BLOCK_N x BLOCK_K
+        weight_ptrs += BLOCK_N * stride_wn
 
         # optional fused activation gradient (while the data is in shared memory)
         if META["ACTIVATION_GRAD"]:
             if META["ACTIVATION_GRAD_REQ_INPUTS"]:
                 # This activation requires its inputs
-                act_input = tl.load(ACT_IN)
+                act_input = tl.load(act_in_ptrs)
                 grad_act = act_grad_fn(act_input)
-                ACT_IN += BLOCK_N * stride_ain
+                act_in_ptrs += BLOCK_N
             else:
                 # Save some time, we can reuse the outputs to know about the grad
                 grad_act = act_grad_fn(grad_out)
@@ -295,19 +296,16 @@ def kernel_fma_grad_in(
 
         # store grad_act as an intermediate, will be used for grad/weight and grad/bias
         if META["SAVE_ACT_GRAD"]:
-            tl.store(GRAD_ACT, grad_out)
+            tl.store(grad_act_ptrs, grad_out)
+            grad_act_ptrs += BLOCK_N
 
         # gradient #1: input with respect to outputs
         # grad_in is grad_out scaled by the (transposed) weight
         grad_in += tl.dot(grad_out, w)
 
-        # increment pointers so that the next blocks of A and B are loaded during the next iteration
-        GRAD_OUT += BLOCK_N * stride_gon
-        GRAD_ACT += BLOCK_N * stride_gan
-        W += BLOCK_N * stride_wn
-
     # write back result
-    tl.store(GRAD_IN, grad_in, mask=(rm[:, None] < M) & (rk[None, :] < K))  # type promotion or downgrade is automatic
+    grad_in_ptrs = GRAD_IN + rm[:, None] * stride_gim + rk[None, :] + batch_id * stride_gib
+    tl.store(grad_in_ptrs, grad_in, mask=(rm[:, None] < M) & (rk[None, :] < K))
 
 
 # Activation needs to be a triton kernel
@@ -326,6 +324,9 @@ def fused_matmul_backward(
 
     .. note: The weight buffer is transposed on the fly
     """
+
+    if not grad_out.is_contiguous():
+        grad_out = grad_out.contiguous()
 
     grad_out_ = grad_out if grad_out.ndim == 3 else grad_out.unsqueeze(0)
 
@@ -357,10 +358,10 @@ def fused_matmul_backward(
         # shapes
         M, N, K,
         # strides
-        grad_in.stride(0), grad_in.stride(1), grad_in.stride(2),
-        grad_act.stride(0), grad_act.stride(1), grad_act.stride(2),
-        grad_out_.stride(0), grad_out_.stride(1), grad_out_.stride(2),
-        activation_inputs.stride(0), activation_inputs.stride(1), activation_inputs.stride(2),
+        grad_in.stride(0), grad_in.stride(1),
+        grad_act.stride(0), grad_act.stride(1),
+        grad_out_.stride(0), grad_out_.stride(1),
+        activation_inputs.stride(0), activation_inputs.stride(1),
         weight.stride(0), weight.stride(1),
         # optional fused activation
         ACTIVATION_GRAD=activation_grad,
