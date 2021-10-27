@@ -306,6 +306,102 @@ def kernel_grad_inputs(
     tl.store(grad_in_ptrs, grad_in, mask=(rm[:, None] < M) & (rk[None, :] < K))
 
 
+# fmt: off
+@triton.autotune(
+    configs=[
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 32}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_ROW': 32 , 'BLOCK_COL': 64}, num_stages=5, num_warps=2),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 256}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_ROW': 256, 'BLOCK_COL': 128}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_ROW': 256, 'BLOCK_COL': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 256}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 64 , 'BLOCK_COL': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROW': 128, 'BLOCK_COL': 32}, num_stages=4, num_warps=4),
+        ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def kernel_fused_grad_bias_grad_weight(
+    # data ptrs
+    G_BIAS, G_WEIGHT, G_ACT, INPUT,
+    # shapes
+    M, N, K,
+    # strides
+    stride_gam,
+    stride_im,
+    stride_gwn, stride_gwk,
+    # Meta-parameters
+    **META,
+):
+    # fmt: on
+
+    """
+    Compute the gradient with respect to the bias and weight
+
+    - grad_bias has shape (N)
+    - grad_act has shape (M, N)
+    - grad_weight has shape (K, N)
+    - inputs have shape (M, K)
+
+    This kernel will walk along M:
+        grad_bias <- sum(grad_act, M)
+        grad_weight <- grad_act.transpose() @ inputs     ([N, K] = [N, M] x [M, K])
+    """
+
+    # extract metaparameters
+    BLOCK_N, GROUP_N = META["BLOCK_ROW"], META["GROUP_ROW"]
+    BLOCK_M, BLOCK_K = META["BLOCK_M"], META["BLOCK_COL"]
+
+    # programs are grouped together to improve L2 hit rate
+    pid = tl.program_id(axis=0)
+
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_k = tl.cdiv(K, BLOCK_K)
+    num_pid_in_group = GROUP_N * num_pid_k  # number of programs in group
+    group_id = pid // num_pid_in_group  # id of the group this program is in
+    first_pid_n = group_id * GROUP_N  # row-id of the first program in the group
+    GROUP_N = min(
+        num_pid_n - first_pid_n, GROUP_N
+    )  # if `num_pid_n` isn't divisible by `GROUP_N`, the last group is smaller
+
+    # *within groups*, programs are ordered in a column-major order
+    pid_n = first_pid_n + (pid % GROUP_N)  # row-id of the program in the *launch grid*
+    pid_k = (
+        pid % num_pid_in_group
+    ) // GROUP_N  # col-id of the program in the *launch grid*
+
+    # memory ranges
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    rm = tl.arange(0, BLOCK_M)
+
+    # memory blocks now
+    grad_act_ptrs = G_ACT + rn[:, None] + rm[None, :] * stride_gam
+    inputs_ptrs = INPUT + rm[:, None] * stride_im + rk[None, :]
+
+    # initialize and iteratively update accumulator
+    grad_weight_acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    grad_bias_acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for _ in range(M, 0, -BLOCK_M):
+        grad_act = tl.load(grad_act_ptrs, mask=(rn[:, None] < N) & (rm[None, :] < M), other=0.0)  # BLOCK_N x BLOCK_M
+        inputs = tl.load(inputs_ptrs, mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0)  # BLOCK_M x BLOCK_K
+
+        grad_bias_acc += tl.sum(grad_act, axis=1).to(tl.float32)
+        grad_weight_acc += tl.dot(grad_weight_acc, inputs).to(tl.float32)
+
+        grad_act_ptrs += BLOCK_M * stride_gam
+        inputs_ptrs += BLOCK_M * stride_im
+
+    # write back results
+    grad_weight_ptrs = G_WEIGHT + rn[:, None] * stride_gwn + rk[None, :] * stride_gwk
+    tl.store(grad_weight_ptrs, grad_weight_acc, mask=(rn[:, None] < N) & (rk[None, :] < K))
+
+    tl.store(G_BIAS + rn, grad_bias_acc, mask=rn < N)
+
+
 # Activation needs to be a triton kernel
 def fused_matmul_backward(
     grad_out: torch.Tensor,
@@ -370,35 +466,32 @@ def fused_matmul_backward(
     )
     # fmt: on
 
-    if False and trainable_bias and trainable_weight:
-        pass
-        # # Fuse the bias and weight grad computations
-        # grad_bias: Optional[torch.Tensor] = torch.empty((N,), device=grad_out_.device, dtype=grad_out_.dtype)
-        # grad_weight : Optional[torch.Tensor] = torch.empty_like(weight)
-        # inputs_ = inputs if inputs.ndim == 3 else inputs.unsqueeze(0)
+    if trainable_bias and trainable_weight:
+        # Fuse the bias and weight grad computations
+        grad_bias: Optional[torch.Tensor] = torch.empty((N,), device=grad_out_.device, dtype=grad_out_.dtype)
+        grad_weight : Optional[torch.Tensor] = torch.empty_like(weight)
+        inputs_ = inputs if inputs.ndim == 2 else inputs.flatten(0, 1)
 
-        # def grid(META):
-        #     return (
-        #         triton.cdiv(M, META["BLOCK_ROW"]) * triton.cdiv(K, META["BLOCK_COL"]),
-        #         B,
-        #     )
+        def grid(META):
+            return (
+                triton.cdiv(M, META["BLOCK_ROW"]) * triton.cdiv(K, META["BLOCK_COL"]),
+            )
 
-        # # fmt: off
-        # # This kernel will go over the M dimension
-        # kernel_fused_grad_bias_grad_weight[grid](
-        #     # data ptrs
-        #     grad_bias, grad_weight, grad_act, inputs_,
-        #     # shapes
-        #     M, N, K,
-        #     # strides
-        #     grad_act.stride(0), grad_act.stride(1),
-        #     inputs_.stride(0), inputs_.stride(1),
-        #     grad_weight.stride(0),  # type: ignore   # mypy is drunk
-        #     # data reuse optimization
-        #     GROUP_ROW=8,
-        #     BLOCK_N=32,
-        # )
-        # # fmt: on
+        # fmt: off
+        # This kernel will go over the M dimension
+        kernel_fused_grad_bias_grad_weight[grid](
+            # data ptrs
+            grad_bias, grad_weight, grad_act, inputs_,
+            # shapes
+            M, N, K,
+            # strides
+            grad_act.stride(0), inputs_.stride(0),
+            grad_weight.stride(0), grad_weight.stride(1),  # type: ignore   # mypy is drunk
+            # data reuse optimization
+            GROUP_ROW=8,
+            BLOCK_M=32,
+        )
+        # fmt: on
 
     else:
         grad_bias = torch.sum(grad_act, dim=0) if trainable_bias else None
